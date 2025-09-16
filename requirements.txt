@@ -5,3 +5,4 @@ sentence-transformers
 torch 
 underthesea
 redis
+dotenv
