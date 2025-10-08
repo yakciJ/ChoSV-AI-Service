@@ -234,17 +234,17 @@ def build_search_sql(filter_by_ids: bool = False) -> str:
             FROM cand
         )
         SELECT
-            id,
-            title,
-            category,
-            match_bonus,
-            vector_score,
-            (%s::float8) * vector_score + (1 - %s::float8) * norm_bonus AS total_score
+            id
         FROM scored
-        ORDER BY total_score DESC
+        ORDER BY (%s::float8) * vector_score + (1 - %s::float8) * norm_bonus DESC
         LIMIT %s
         """
 
+# title,
+# category,
+# match_bonus,
+# vector_score,
+# (%s::float8) * vector_score + (1 - %s::float8) * norm_bonus AS total_score
 
 # =========================
 # Redis cache (sync)
@@ -408,19 +408,7 @@ def _search_products_core(q: str, page: int, page_size: int, product_ids: Option
     # Rest of the function remains the same...
 
     # Normalize output types and cache
-    full_list: List[Dict[str, Any]] = []
-    for r in rows:
-        full_list.append(
-            {
-                "id": int(r["id"]),
-                "title": r["title"],
-                "category": r["category"],
-                "match_bonus": float(r["match_bonus"]),
-                "vector_score": float(r["vector_score"]),
-                "total_score": float(r["total_score"]),  # already in [0,1]
-            }
-        )
-
+    full_list = [int(r["id"]) for r in rows]
     _cache_set_full_list(cache_key, full_list)
 
     total = len(full_list)
@@ -460,7 +448,6 @@ def search_endpoint(
                 parsed_product_ids = [int(pid.strip()) for pid in product_ids.split(',') if pid.strip()]
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid product_ids format. Use comma-separated integers.")
-        
         return search_products(q, page=page, page_size=page_size, product_ids=parsed_product_ids)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
