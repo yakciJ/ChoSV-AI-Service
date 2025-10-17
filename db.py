@@ -1,8 +1,8 @@
-import psycopg2
+import asyncpg
 import os
 
-def get_connection():
-    conn = psycopg2.connect(
+async def get_async_connection():
+    conn = await asyncpg.connect(
         dbname=os.getenv("PG_DB", "ChoSV"),
         user=os.getenv("PG_USER", "postgres"),
         password=os.getenv("PG_PASS", "1234"),

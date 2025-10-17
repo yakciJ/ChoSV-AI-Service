@@ -44,13 +44,13 @@ from model import embed as embed_query  # type: ignore
 
 # Redis (sync) is optional
 try:
-    import redis  # type: ignore
+    import aioredis as redis # type: ignore
 except Exception:  # pragma: no cover
     redis = None  # type: ignore
 
 # DB connection (psycopg2)
-from db import get_connection  # type: ignore
-from psycopg2.extras import RealDictCursor  # type: ignore
+from db import get_async_connection  # type: ignore
+# from psycopg2.extras import RealDictCursor  # type: ignore
 
 
 # =========================
@@ -230,11 +230,11 @@ def build_search_sql(filter_by_ids: bool = False) -> str:
     15: product_ids (int[]) -- if filter_by_ids True (appears before LIMIT)
     16: limit_k   -- when filter_by_ids True, otherwise 15 is limit_k
     """
-    product_filter = "AND p.id = ANY(%s::int[])" if filter_by_ids else ""
+    product_filter = "AND p.id = ANY($15)" if filter_by_ids else ""
     return f"""
         WITH q AS (
             -- full sentence is unaccented before building websearch_to_tsquery
-            SELECT websearch_to_tsquery('simple', unaccent(%s)) AS full_q
+            SELECT websearch_to_tsquery('simple', unaccent($1)) AS full_q
         ),
         cand AS (
             SELECT
@@ -244,17 +244,17 @@ def build_search_sql(filter_by_ids: bool = False) -> str:
                     + COALESCE((
                         -- phrases SUM: unaccent each phrase parameter before plainto_tsquery
                         SELECT SUM( (p.tsv @@ plainto_tsquery('simple', unaccent(unnest_ph)))::int )
-                        FROM unnest(%s::text[]) AS unnest_ph
+                        FROM unnest($2::text[]) AS unnest_ph
                     ), 0) * 3
                     + COALESCE((
                         -- tokens SUM: unaccent each token parameter before plainto_tsquery
                         SELECT SUM( (p.tsv @@ plainto_tsquery('simple', unaccent(unnest_tk)))::int )
-                        FROM unnest(%s::text[]) AS unnest_tk
+                        FROM unnest($3::text[]) AS unnest_tk
                     ), 0) * 1
                     + COALESCE((
                         -- noun bonus: unaccent nouns and use ordinality for position-based multiplier
-                        SELECT SUM( (p.tsv @@ plainto_tsquery('simple', unaccent(n)))::int * ((%s - ord + 1) * 10) )
-                        FROM unnest(%s::text[]) WITH ORDINALITY AS t(n, ord)
+                        SELECT SUM( (p.tsv @@ plainto_tsquery('simple', unaccent(n)))::int * (($4 - ord + 1) * 10) )
+                        FROM unnest($5::text[]) WITH ORDINALITY AS t(n, ord)
                     ), 0)
                 ) AS match_bonus
             FROM products p
@@ -262,21 +262,21 @@ def build_search_sql(filter_by_ids: bool = False) -> str:
                 (
                     (p.tsv @@ (SELECT full_q FROM q))
                     -- tokens_ts guard: apply unaccent to the tokens_ts string before to_tsquery
-                    OR ( %s <> '' AND p.tsv @@ to_tsquery('simple', unaccent(%s)) )
+                    OR ( $6 <> '' AND p.tsv @@ to_tsquery('simple', unaccent($7)) )
                     OR EXISTS (
                         -- phrases existence: unaccent phrase element
-                        SELECT 1 FROM unnest(%s::text[]) ph
+                        SELECT 1 FROM unnest($8::text[]) ph
                         WHERE p.tsv @@ plainto_tsquery('simple', unaccent(ph))
                     )
                     OR EXISTS (
                         -- tokens existence: unaccent token element
-                        SELECT 1 FROM unnest(%s::text[]) tk
+                        SELECT 1 FROM unnest($9::text[]) tk
                         WHERE p.tsv @@ plainto_tsquery('simple', unaccent(tk))
                     )
                 )
                 -- if num_nouns > 0 then require at least one noun match (unaccented)
-                AND ( %s = 0 OR EXISTS (
-                    SELECT 1 FROM unnest(%s::text[]) nn WHERE p.tsv @@ plainto_tsquery('simple', unaccent(nn))
+                AND ( $10 = 0 OR EXISTS (
+                    SELECT 1 FROM unnest($11::text[]) nn WHERE p.tsv @@ plainto_tsquery('simple', unaccent(nn))
                 ))
                 {product_filter}
         ),
@@ -286,7 +286,7 @@ def build_search_sql(filter_by_ids: bool = False) -> str:
                 title,
                 category,
                 match_bonus,
-                (1 - (embedding <=> %s::vector)) AS vector_score,
+                (1 - (embedding <=> $12::vector)) AS vector_score,
                 CASE
                     WHEN MAX(match_bonus) OVER () > 0
                         THEN match_bonus::float / MAX(match_bonus) OVER ()
@@ -297,8 +297,8 @@ def build_search_sql(filter_by_ids: bool = False) -> str:
         SELECT
             id
         FROM scored
-        ORDER BY (%s::float8) * vector_score + (1 - %s::float8) * norm_bonus DESC
-        LIMIT %s
+        ORDER BY ($13::float8) * vector_score + (1 - $14::float8) * norm_bonus DESC
+        LIMIT $""" + ("16" if filter_by_ids else "15") + """
         """
 
 
@@ -306,16 +306,16 @@ def build_search_sql(filter_by_ids: bool = False) -> str:
 # Redis cache (sync)
 # =========================
 
-_REDIS: Optional["redis.Redis"] = None  # type: ignore
+_REDIS: Optional["aioredis.Redis"] = None  # type: ignore
 
 
-def _get_redis() -> Optional["redis.Redis"]:  # type: ignore
+async def _get_redis() -> Optional["aioredis.Redis"]:  # type: ignore
     global _REDIS
     if redis is None:
         return None
     if _REDIS is None:
         try:
-            _REDIS = redis.from_url(REDIS_URL, decode_responses=True)
+            _REDIS = await redis.from_url(REDIS_URL, decode_responses=True)
         except Exception:
             _REDIS = None
     return _REDIS
@@ -343,22 +343,22 @@ def _make_cache_key(query: str, page_size: int, product_ids: Optional[List[int]]
     return f"search:{h}"
 
 
-def _cache_set_full_list(key: str, data: List[Dict[str, Any]]) -> None:
-    r = _get_redis()
+async def _cache_set_full_list(key: str, data: List[Dict[str, Any]]) -> None:
+    r = await _get_redis()
     if r is None:
         return
     try:
-        r.setex(key, CACHE_TTL, json.dumps(data, ensure_ascii=False))
+        await r.setex(key, CACHE_TTL, json.dumps(data, ensure_ascii=False))
     except Exception:
         pass  # ignore cache errors
 
 
-def _cache_get_full_list(key: str) -> Optional[List[Dict[str, Any]]]:
-    r = _get_redis()
+async def _cache_get_full_list(key: str) -> Optional[List[Dict[str, Any]]]:
+    r = await _get_redis()
     if r is None:
         return None
     try:
-        raw = r.get(key)
+        raw = await r.get(key)
         if not raw:
             return None
         return json.loads(raw)
@@ -370,7 +370,7 @@ def _cache_get_full_list(key: str) -> Optional[List[Dict[str, Any]]]:
 # Core search (sync)
 # =========================
 
-def _search_products_core(q: str, page: int, page_size: int, product_ids: Optional[List[int]] = None) -> Dict[str, Any]:
+async def _search_products_core(q: str, page: int, page_size: int, product_ids: Optional[List[int]] = None) -> Dict[str, Any]:
     q_norm = normalize_query(q)
 
     if product_ids:
@@ -380,7 +380,7 @@ def _search_products_core(q: str, page: int, page_size: int, product_ids: Option
 
     # Make cache key with product_ids considered
     cache_key = _make_cache_key(q_norm, page_size, product_ids)
-    cached = _cache_get_full_list(cache_key)
+    cached = await _cache_get_full_list(cache_key)
     if cached is not None:
         total = len(cached)
         start = max(0, (page - 1) * page_size)
@@ -440,7 +440,7 @@ def _search_products_core(q: str, page: int, page_size: int, product_ids: Option
         ]
 
     # Defensive check: ensure params count matches placeholders (useful for dev)
-    expected_placeholders = sql.count("%s")
+    expected_placeholders = sql.count("$")
     if len(params) != expected_placeholders:
         # helpful debug info before raising
         raise RuntimeError(f"Param/placeholder mismatch: expected {expected_placeholders} params but got {len(params)}. "
@@ -448,12 +448,10 @@ def _search_products_core(q: str, page: int, page_size: int, product_ids: Option
                            f"phrases_len={len(phrases)} tokens_len={len(tokens)} nouns_len={len(nouns)}")
 
     # Query DB
-    conn = get_connection()
+    conn = await get_async_connection()
     try:
-        conn.autocommit = True
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             try:
-                cur.execute(sql, params)
+                rows = await conn.fetch(sql, *params)
             except Exception as e:
                 # Safety fallback: if tokens_ts causes tsquery syntax issues, retry with tokens_ts disabled
                 if "tsquery" in str(e).lower():
@@ -484,7 +482,8 @@ def _search_products_core(q: str, page: int, page_size: int, product_ids: Option
                             tokens,
                             num_nouns,
                             nouns,
-                            "", "",    # disable tokens_ts parts
+                            "", 
+                            "",    # disable tokens_ts parts
                             phrases,
                             tokens,
                             num_nouns,
@@ -502,19 +501,15 @@ def _search_products_core(q: str, page: int, page_size: int, product_ids: Option
 
                     # optional: log original exception e for debugging
                     print("tsquery fallback, original error:", str(e))
-                    cur.execute(sql, params_fallback)
+                    rows = await conn.fetch(sql, *params_fallback)
                 else:
                     raise
-            rows = cur.fetchall()
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        await conn.close()
 
     # Normalize output types and cache
     full_list = [int(r["id"]) for r in rows]
-    _cache_set_full_list(cache_key, full_list)
+    await _cache_set_full_list(cache_key, full_list)
 
     total = len(full_list)
     start = max(0, (page - 1) * page_size)
@@ -524,13 +519,13 @@ def _search_products_core(q: str, page: int, page_size: int, product_ids: Option
     return {"query": q_norm, "page": page, "page_size": page_size, "total": total, "results": page_items}
 
 
-def search_products(q: str, page: int = 1, page_size: int = 20, product_ids: Optional[List[int]] = None) -> Dict[str, Any]:
+async def search_products(q: str, page: int = 1, page_size: int = 20, product_ids: Optional[List[int]] = None) -> Dict[str, Any]:
     """
     Public sync API (callable without FastAPI).
     """
     if not isinstance(q, str) or not q.strip():
         return {"query": "", "page": page, "page_size": page_size, "total": 0, "results": []}
-    return _search_products_core(q, page, page_size, product_ids)
+    return await _search_products_core(q, page, page_size, product_ids)
 
 
 # =========================
@@ -541,7 +536,7 @@ router = APIRouter(prefix="", tags=["search"])  # no extra prefix so endpoint is
 
 
 @router.get("/search")
-def search_endpoint(
+async def search_endpoint(
     q: str = Query(..., min_length=1, description="Search query"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -555,6 +550,6 @@ def search_endpoint(
                 parsed_product_ids = [int(pid.strip()) for pid in product_ids.split(',') if pid.strip()]
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid product_ids format. Use comma-separated integers.")
-        return search_products(q, page=page, page_size=page_size, product_ids=parsed_product_ids)
+        return await search_products(q, page=page, page_size=page_size, product_ids=parsed_product_ids)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
