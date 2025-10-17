@@ -44,8 +44,9 @@ from model import embed as embed_query  # type: ignore
 
 # Redis (sync) is optional
 try:
-    import aioredis as redis # type: ignore
-except Exception:  # pragma: no cover
+    from redis import asyncio as redis  # ✅ modern redis client (replaces aioredis)
+except Exception as e:
+    print(f"❌ Failed to import redis asyncio: {e}")
     redis = None  # type: ignore
 
 # DB connection (psycopg2)
@@ -306,17 +307,17 @@ def build_search_sql(filter_by_ids: bool = False) -> str:
 # Redis cache (sync)
 # =========================
 
-_REDIS: Optional["aioredis.Redis"] = None  # type: ignore
+_REDIS: Optional["redis.Redis"] = None  # type: ignore
 
 
-async def _get_redis() -> Optional["aioredis.Redis"]:  # type: ignore
+async def _get_redis() -> Optional["redis.Redis"]:  # type: ignore
     global _REDIS
     if redis is None:
         return None
     if _REDIS is None:
         try:
-            _REDIS = await redis.from_url(REDIS_URL, decode_responses=True)
-        except Exception:
+            _REDIS = await redis.from_url(REDIS_URL)
+        except Exception as e:
             _REDIS = None
     return _REDIS
 
@@ -343,7 +344,7 @@ def _make_cache_key(query: str, page_size: int, product_ids: Optional[List[int]]
     return f"search:{h}"
 
 
-async def _cache_set_full_list(key: str, data: List[Dict[str, Any]]) -> None:
+async def _cache_set_full_list(key: str, data: List[int]) -> None:
     r = await _get_redis()
     if r is None:
         return
@@ -353,7 +354,7 @@ async def _cache_set_full_list(key: str, data: List[Dict[str, Any]]) -> None:
         pass  # ignore cache errors
 
 
-async def _cache_get_full_list(key: str) -> Optional[List[Dict[str, Any]]]:
+async def _cache_get_full_list(key: str) -> Optional[List[int]]:
     r = await _get_redis()
     if r is None:
         return None
@@ -380,6 +381,7 @@ async def _search_products_core(q: str, page: int, page_size: int, product_ids: 
 
     # Make cache key with product_ids considered
     cache_key = _make_cache_key(q_norm, page_size, product_ids)
+
     cached = await _cache_get_full_list(cache_key)
     if cached is not None:
         total = len(cached)
@@ -387,7 +389,6 @@ async def _search_products_core(q: str, page: int, page_size: int, product_ids: 
         end = min(total, start + page_size)
         page_items = cached[start:end] if start < total else []
         return {"query": q_norm, "page": page, "page_size": page_size, "total": total, "results": page_items}
-
     # Build query parts (now returns nouns as well)
     full_sentence, phrases, tokens, nouns = split_query_vi(q_norm)
     tokens_ts = build_tokens_tsquery_string(tokens)
@@ -510,6 +511,12 @@ async def _search_products_core(q: str, page: int, page_size: int, product_ids: 
     # Normalize output types and cache
     full_list = [int(r["id"]) for r in rows]
     await _cache_set_full_list(cache_key, full_list)
+    print(f"💾 Stored {len(full_list)} results to cache")
+    verification = await _cache_get_full_list(cache_key)
+    if verification is not None:
+        print(f"✅ Verification: Cache now contains {len(verification)} items")
+    else:
+        print("❌ Verification failed: Cache is still empty after storage!")
 
     total = len(full_list)
     start = max(0, (page - 1) * page_size)

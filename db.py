@@ -3,7 +3,7 @@ import os
 
 async def get_async_connection():
     conn = await asyncpg.connect(
-        dbname=os.getenv("PG_DB", "ChoSV"),
+        database=os.getenv("PG_DB", "ChoSV"),
         user=os.getenv("PG_USER", "postgres"),
         password=os.getenv("PG_PASS", "1234"),
         host=os.getenv("PG_HOST", "localhost"),
