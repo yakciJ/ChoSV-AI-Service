@@ -3,7 +3,7 @@ import uvicorn
 import logging
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
-from insert import router as insert_router
+from productController import router as insert_router
 from search import router as search_router
 from dotenv import load_dotenv
 
