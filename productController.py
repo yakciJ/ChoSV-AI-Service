@@ -1,70 +1,64 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from db import get_async_connection
 from model import embed
 import asyncio
+from pydantic import BaseModel
 
 router = APIRouter()
 
-@router.post("/insert")
-async def insert_product(id: int, title: str, category: str):
-    # Generate the embedding vector
-    vector = await asyncio.to_thread(embed, f"{title} {category}")
-    vector_str = "[" + ", ".join(map(str, vector)) + "]"
-    # Connect to the database
+class UpdateEmbeddingRequest(BaseModel):
+    productName: str
+    childestCategoryName: str = ""
+    description: str = ""
+
+@router.put("/update-embedding/{product_id}")
+async def update_product_embedding(
+    product_id: int,
+    data: UpdateEmbeddingRequest
+):
+    """
+    Updates both Embedding and TSV for a product.
+    
+    Embedding: ProductName + Childest Category + Description
+    TSV: ProductName + Childest Category (for word-by-word search)
+    
+    ASP.NET should call this after creating/updating a product.
+    """
     conn = await get_async_connection()
     try:
-        await conn.execute(
+        # Build embedding text: ProductName + Childest Category + Description
+        embed_text = f"{data.productName} {data.childestCategoryName} {data.description}".strip()
+        
+        # Build TSV text: ProductName + Childest Category (no description)
+        tsv_text = f"{data.productName} {data.childestCategoryName}".strip()
+        
+        # Generate embedding
+        vector = await asyncio.to_thread(embed, embed_text)
+        vector_str = "[" + ", ".join(map(str, vector)) + "]"
+        
+        # Update BOTH Embedding and TSV (with quotes for case-sensitive table/column names)
+        result = await conn.execute(
             """
-            INSERT INTO products (id, title, category, embedding, tsv)
-            VALUES ($1, $2, $3, $4::vector, to_tsvector('simple', $5 || ' ' || $6))
-            ON CONFLICT (id)
-            DO UPDATE SET 
-                title = EXCLUDED.title, 
-                category = EXCLUDED.category, 
-                embedding = EXCLUDED.embedding,
-                tsv = EXCLUDED.tsv
+            UPDATE "Products"
+            SET "Embedding" = $2::vector,
+                "TSV" = to_tsvector('simple', unaccent($3))
+            WHERE "ProductId" = $1
             """,
-            id, title, category, vector_str, title, category
+            product_id, vector_str, tsv_text
         )
+        
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail=f"Product {product_id} not found")
+        
+        return {
+            "status": "ok", 
+            "productId": product_id,
+            "embeddedText": embed_text,
+            "tsvText": tsv_text
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         await conn.close()
-    return {"status": "ok"}
-
-@router.put("/update")
-async def update_product(id: int, title: str, category: str):
-    # Generate the embedding vector
-    vector = await asyncio.to_thread(embed, f"{title} {category}")
-    vector_str = "[" + ", ".join(map(str, vector)) + "]"
-
-    # Connect to the database
-    conn = await get_async_connection()
-    try:
-        await conn.execute(
-            """
-            UPDATE products
-            SET title = $2, category = $3, embedding = $4, tsv = to_tsvector('simple', $2 || ' ' || $3)
-            WHERE id = $1
-            """,
-            id, title, category, vector_str
-        )
-    finally:
-        await conn.close()
-
-    return {"status": "ok"}
-
-@router.delete("/delete")
-async def delete_product(id: int):
-    # Connect to the database
-    conn = await get_async_connection()
-    try:
-        await conn.execute(
-            """
-            DELETE FROM products
-            WHERE id = $1
-            """,
-            id
-        )
-    finally:
-        await conn.close()
-
-    return {"status": "ok"}
